@@ -9,17 +9,23 @@ const {
   Events,
 } = require('discord.js');
 
+const vicePrincipal = require('./vicePrincipal');
+
 const verificationData = new Map();
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates,
   ],
 });
 
 client.once(Events.ClientReady, async () => {
   console.log('Bot is online and ready!');
+  vicePrincipal.initAI();
 
   if (!process.env.VERIFY_CHANNEL_ID) {
     console.error('VERIFY_CHANNEL_ID is not set in environment variables.');
@@ -196,6 +202,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }).catch(() => {});
     }
   }
+});
+
+client.on(Events.MessageCreate, (message) => {
+  vicePrincipal.handleMessage(message, client);
+});
+
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  vicePrincipal.handleVoiceStateUpdate(oldState, newState, client);
 });
 
 client.login(process.env.DISCORD_TOKEN);
