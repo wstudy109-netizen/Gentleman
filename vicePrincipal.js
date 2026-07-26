@@ -49,7 +49,7 @@ async function generateVPResponse({ promptContext, defaultFallbackCategory = 'me
         config: {
           systemInstruction: SYSTEM_PROMPT,
           temperature: 0.7,
-          maxOutputTokens: 150,
+          maxOutputTokens: 1000,
         },
       });
 
