@@ -1,3 +1,7 @@
+const { spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+const { AttachmentBuilder, MessageFlags } = require('discord.js');
 const { GoogleGenAI } = require('@google/genai');
 const { SYSTEM_PROMPT, FALLBACK_RESPONSES } = require('./persona');
 
@@ -7,6 +11,61 @@ const COOLDOWN_MS = 5 * 60 * 1000;
 const RANDOM_INSPECTION_CHANCE = 0.07; // 7% chance on suitable chat messages
 
 let aiClient = null;
+
+async function generateVoiceAudio(text) {
+  return new Promise((resolve) => {
+    // Strip action descriptions in asterisks like *opens diary*, *routine inspection*, etc.
+    let cleanText = text.replace(/\*.*?\*/g, ' ');
+    cleanText = cleanText.replace(/[_#~`]/g, '').replace(/\s+/g, ' ').trim();
+    if (!cleanText) return resolve(null);
+
+    const tmpDir = path.join(__dirname, 'tmp_audio');
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+
+    const outputPath = path.join(tmpDir, `vp_voice_${Date.now()}_${Math.floor(Math.random() * 1000)}.ogg`);
+    const scriptPath = path.join(__dirname, 'voice_engine.py');
+
+    const venvPy = path.join(__dirname, 'venv_xtts', 'bin', 'python');
+    const pyExec = fs.existsSync(venvPy) ? venvPy : 'python3';
+
+    const pyProcess = spawn(pyExec, [scriptPath, cleanText, outputPath]);
+    let stdoutData = '';
+
+    pyProcess.stdout.on('data', (data) => {
+      stdoutData += data.toString();
+    });
+
+    pyProcess.on('close', (code) => {
+      if (code === 0) {
+        try {
+          const jsonMatch = stdoutData.match(/\{"status":\s*"success".*\}/);
+          if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            if (fs.existsSync(parsed.file)) {
+              return resolve({
+                audioPath: parsed.file,
+                duration: parsed.duration || 5,
+                waveform: parsed.waveform || '',
+              });
+            }
+          }
+        } catch (e) {
+          console.error('Error parsing voice engine JSON:', e);
+        }
+        if (fs.existsSync(outputPath)) {
+          return resolve({ audioPath: outputPath, duration: 5, waveform: '' });
+        }
+      }
+      console.error(`Voice engine exited with code ${code}`);
+      resolve(null);
+    });
+
+    pyProcess.on('error', (err) => {
+      console.error('Error executing voice engine:', err);
+      resolve(null);
+    });
+  });
+}
 
 function initAI() {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -37,30 +96,32 @@ function getRandomItem(array) {
 
 async function generateVPResponse({ promptContext, defaultFallbackCategory = 'mentions' }) {
   if (aiClient && process.env.GEMINI_API_KEY) {
-    try {
-      const response = await aiClient.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: promptContext }],
+    const modelsToTry = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash-latest'];
+    for (const modelName of modelsToTry) {
+      try {
+        const response = await aiClient.models.generateContent({
+          model: modelName,
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: promptContext }],
+            },
+          ],
+          config: {
+            systemInstruction: SYSTEM_PROMPT,
+            temperature: 0.7,
+            maxOutputTokens: 1000,
           },
-        ],
-        config: {
-          systemInstruction: SYSTEM_PROMPT,
-          temperature: 0.7,
-          maxOutputTokens: 1000,
-        },
-      });
+        });
 
-      if (response && response.text) {
-        let cleanText = response.text.trim();
-        // Remove any markdown block wrappers if present
-        cleanText = cleanText.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
-        if (cleanText) return cleanText;
+        if (response && response.text) {
+          let cleanText = response.text.trim();
+          cleanText = cleanText.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+          if (cleanText) return cleanText;
+        }
+      } catch (err) {
+        console.error(`Vice Principal Bot: Model ${modelName} failed:`, err.message);
       }
-    } catch (err) {
-      console.error('Vice Principal Bot: AI generation failed, using fallback:', err.message);
     }
   }
 
@@ -101,7 +162,20 @@ async function handleMessage(message, client) {
         promptContext,
         defaultFallbackCategory: 'mentions',
       });
-      await message.reply(replyText);
+      const voiceData = await generateVoiceAudio(replyText);
+      if (voiceData && voiceData.audioPath) {
+        const attachment = new AttachmentBuilder(voiceData.audioPath, { name: 'voice_message.ogg' });
+        if (voiceData.waveform) attachment.setWaveform(voiceData.waveform);
+        if (voiceData.duration) attachment.setDuration(voiceData.duration);
+
+        await message.reply({
+          files: [attachment],
+          flags: [MessageFlags.IsVoiceMessage],
+        });
+        setTimeout(() => fs.unlink(voiceData.audioPath, () => {}), 10000);
+      } else {
+        await message.reply(replyText);
+      }
       channelCooldowns.set(message.channel.id, now);
     } catch (err) {
       console.error('Error sending VP reply:', err);
@@ -126,7 +200,20 @@ async function handleMessage(message, client) {
           promptContext,
           defaultFallbackCategory: 'randomInspections',
         });
-        await message.channel.send(inspectionText);
+        const voiceData = await generateVoiceAudio(inspectionText);
+        if (voiceData && voiceData.audioPath) {
+          const attachment = new AttachmentBuilder(voiceData.audioPath, { name: 'voice_message.ogg' });
+          if (voiceData.waveform) attachment.setWaveform(voiceData.waveform);
+          if (voiceData.duration) attachment.setDuration(voiceData.duration);
+
+          await message.channel.send({
+            files: [attachment],
+            flags: [MessageFlags.IsVoiceMessage],
+          });
+          setTimeout(() => fs.unlink(voiceData.audioPath, () => {}), 10000);
+        } else {
+          await message.channel.send(inspectionText);
+        }
         channelCooldowns.set(message.channel.id, now);
       } catch (err) {
         console.error('Error sending random inspection:', err);
